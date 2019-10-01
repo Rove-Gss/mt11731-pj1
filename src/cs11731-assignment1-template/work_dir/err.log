@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "nmt.py", line 474, in <module>
+    main()
+  File "nmt.py", line 466, in main
+    train(args)
+  File "nmt.py", line 314, in train
+    vocab=vocab)
+  File "nmt.py", line 149, in __init__
+    self.encoder = EncoderRNN()
+TypeError: __init__() missing 2 required positional arguments: 'input_size' and 'hidden_size'
