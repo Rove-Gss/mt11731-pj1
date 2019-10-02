@@ -86,7 +86,7 @@ def sentence_filter(string):
     return string
 
 
-def sentence2Tensor(dict, input_list: List[List[str]],transpose):
+def sentence2Tensor(dict, input_list: List[List[str]], transpose):
     total = input_list.__len__()
     sentence_indexes = []
     lens = []
@@ -105,11 +105,12 @@ def sentence2Tensor(dict, input_list: List[List[str]],transpose):
 
     #    batch = list(itertools.zip_longest(sentence_indexes, fillvalue=0))
     max_len = max((len(l) for l in sentence_indexes))
-    sentence_indexes = list(map(lambda l: l + [0] * (MAX_LENGTH - len(l)), sentence_indexes))
+    sentence_indexes = list(map(lambda l: l + [0] * (max_len - len(l)), sentence_indexes))
 
     if transpose == True:
         sentence_indexes = list(zip(*sentence_indexes))
-    return torch.tensor(sentence_indexes, dtype=torch.long, device=device), max_len
+
+    return torch.tensor(sentence_indexes, dtype=torch.long, device=device), max_len, lens
 
 
 class EncoderRNN(nn.Module):
@@ -120,14 +121,16 @@ class EncoderRNN(nn.Module):
         self.embedding = nn.Embedding(input_size, hidden_size)
         self.gru = nn.GRU(hidden_size, hidden_size)
 
-    def forward(self, input, hidden):
-        embedded = self.embedding(input).view(MAX_LENGTH, batch_size, -1)
+    def forward(self, input, hidden,src_lens_list):
+        #        embedded = self.embedding(input).view(MAX_LENGTH, batch_size, -1)
+        embedded = self.embedding(input)
+        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, src_lens_list,enforce_sorted=False)
         output = embedded
-        output, hidden = self.gru(output, hidden)
-
+        output, hidden = self.gru(batch_packed, hidden)
+        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
         return output, hidden
 
-    def initHidden(self):
+    def initHidden(self, batch_size):
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
 
 
@@ -141,16 +144,29 @@ class DecoderRNN(nn.Module):
 
         self.softmax = nn.LogSoftmax(dim=1)
 
-    def forward(self, input, hidden):
-        output = self.embedding(input).view(MAX_LENGTH, batch_size, -1)
+    def forward(self, input, hidden, batch_size,tgt_length, tgt_lens_list):
+        '''
+
+        input = input.unsqueeze(0)
+        embeded = self.embedding(input)
+
+        output, hidden = self.gru(embeded,hidden)
+
+        return self.out(output.squeeze(0)),hidden
+
+        '''
+
+        output = self.embedding(input).view(tgt_length, batch_size, -1)
+        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(output, tgt_lens_list,enforce_sorted=False)
+        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
         output = F.relu(output)
         output, hidden = self.gru(output, hidden)
 
-        output = self.softmax(self.out(output[0]))
-
+        # output = self.softmax(self.out(output[0]))
+        output = self.softmax(self.out(output))
         return output, hidden
 
-    def initHidden(self):
+    def initHidden(self, batch_size):
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
 
 
@@ -175,7 +191,6 @@ class AttnDecoderRNN(nn.Module):
         embedded = self.dropout(embedded)
         tmp = embedded
         # for i in range(MAX_LENGTH):
-
         tmp = torch.cat((embedded[0], hidden[0]), 1)
 
         attn_weights = F.softmax(
@@ -209,25 +224,25 @@ class NMT(object):
         print("start to init encoder and decoder.")
         self.encoder = EncoderRNN(vocab.src.__len__(), hidden_size).to(device)
         print("Encoder is done!")
-        self.decoder = AttnDecoderRNN(hidden_size, vocab.tgt.__len__(), dropout_rate).to(device)
+        # self.decoder = AttnDecoderRNN(hidden_size, vocab.tgt.__len__(), dropout_rate).to(device)
+        self.decoder = DecoderRNN(hidden_size, vocab.tgt.__len__()).to(device)
         print("Decoder is done!")
         # self.encoder = EncoderRNN()
         # set the model
 
         # initialize neural network layers...
 
-    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> Tensor:
+    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]], batch_size) -> Tensor:
+        '''
         encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=self.lr)
         decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
 
         criterion = nn.NLLLoss()
         # assert(src_sents.__len__(),tgt_sents.__len__())
-        starttime = time.time()
 
         src_tensor, src_len = sentence2Tensor(self.vocab.src, src_sents,True)
-        tgt_tensor, tgt_len = sentence2Tensor(self.vocab.tgt, tgt_sents,False)
+        tgt_tensor, tgt_len = sentence2Tensor(self.vocab.tgt, tgt_sents,True)
 
-        #       for i in range(src_tensor_list.__len__()):
         loss = 0
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
@@ -235,49 +250,44 @@ class NMT(object):
         input_length = src_tensor.size(0)
         target_length = tgt_tensor.size(0)
 
-        encoder_outputs = torch.zeros(MAX_LENGTH, self.encoder.hidden_size, device=device)
-
-        # for ei in range(0, input_length):
         encoder_output, encoder_hidden = self.encoder(src_tensor, encoder_hidden)
+
+'''
+
+        encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=self.lr)
+        decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
+
+        criterion = nn.NLLLoss()
+        # assert(src_sents.__len__(),tgt_sents.__len__())
+
+        src_tensor, src_len, src_lens_list = sentence2Tensor(self.vocab.src, src_sents, True)
+        tgt_tensor, tgt_len, tgt_lens_lits = sentence2Tensor(self.vocab.tgt, tgt_sents, True)
+
+        #       for i in range(src_tensor_list.__len__()):
+        loss = 0
+        encoder_optimizer.zero_grad()
+        decoder_optimizer.zero_grad()
+        encoder_hidden = self.encoder.initHidden(batch_size)
+
+        # encoder_outputs = torch.zeros(MAX_LENGTH, batch_size, self.encoder.hidden_size, device=device)
+
+        encoder_output, encoder_hidden = self.encoder(src_tensor, encoder_hidden, src_lens_list)
         # encoder_outputs = encoder_output[0, 0]
-        encoder_outputs[1] = encoder_output[0, 0]
-
-        # decoder_input = []
-        #
-        # for i in range(0, MAX_LENGTH):
-        #     tmp_list = []
-        #     for j in range(0, batch_size):
-        #         if i == 0:
-        #             tmp_list.append(1)
-        #         else:
-        #             tmp_list.append(0)
-        #     decoder_input.append(tmp_list)
-
-        decoder_input = []
-
-        for j in range(0,MAX_LENGTH):
-            tmp = []
-            if j == 0:
-                for i in range(0,batch_size):
-                    tmp.append(1)
-            else:
-                for i in range(0,batch_size):
-                    tmp.append(0)
-            decoder_input.append(tmp)
-        decoder_input = torch.tensor(decoder_input, dtype=torch.long, device=device)
+        encoder_outputs = encoder_output
 
         decoder_hidden = encoder_hidden
 
-        # for di in range(0, target_length):
-        decoder_output, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_hidden,
-                                                                         encoder_outputs)
-        topv, topi = decoder_output.topk(1)
-        decoder_input = topi.squeeze().detach()
+        decoder_output, decoder_hidden = self.decoder(tgt_tensor, decoder_hidden, batch_size,tgt_len, tgt_lens_lits)
+        # topv, topi = decoder_output.topk(1)
+        # decoder_input = topi.squeeze().detach()
 
-        for i in range(batch_size):
-            tmp1 = decoder_output[i].view(1,-1)
-            tmp2 = tgt_tensor[i].view(-1)
-            loss += criterion(tmp1,tmp2)
+        #        for i in range(batch_size):
+        #            tmp1 = decoder_output[i]
+        #            tmp2 = tgt_tensor[i]
+
+        decoder_output = decoder_output[0:].view(-1, decoder_output.shape[-1])
+        tgt_tensor = tgt_tensor[0:].view(-1)
+        loss = criterion(decoder_output, tgt_tensor)
 
         # for i in range(0, batch_size):
         #     tmp2 = torch.unsqueeze(decoder_output[i],0)
@@ -287,7 +297,6 @@ class NMT(object):
         #         tmp = criterion(tmp2, tgt_tensor[i][j].view(1))
         #         loss += tmp
 
-
         # if decoder_input.item() == 1:
         #     break
 
@@ -295,9 +304,7 @@ class NMT(object):
 
         encoder_optimizer.step()
         decoder_optimizer.step()
-        print('model time:', timeSince(starttime, 0.1))
-        return loss.item() / target_length
-
+        return loss.item()
 
     """
 take a mini-batch of source and target sentences, compute the log-likelihood of 
@@ -313,8 +320,6 @@ Returns:
         each example in the input batch
 """
 
-
-
     # def encode(self, src_sents: List[List[str]]):
     #
     #
@@ -329,7 +334,6 @@ Returns:
     #             with shape (batch_size, source_sentence_length, encoding_dim), or in orther formats
     #         decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
     #     """
-
 
     # def decode(self, src_encodings: Tensor, decoder_init_state, tgt_sents: List[List[str]]):
     # """
@@ -348,29 +352,31 @@ Returns:
     # """
     #     return 0
 
+    #        return scores
 
+    def beam_search(self, src_sent: List[str], beam_size: int = 5, max_decoding_time_step: int = 70) -> List[
+        Hypothesis]:
+        """
+        Given a single source sentence, perform beam search
 
-#        return scores
+        Args:
+            src_sent: a single tokenized source sentence
+            beam_size: beam size
+            max_decoding_time_step: maximum number of time steps to unroll the decoding RNN
 
-    # def beam_search(self, src_sent: List[str], beam_size: int = 5, max_decoding_time_step: int = 70) -> List[Hypothesis]:
-    #     """
-    #     Given a single source sentence, perform beam search
-    #
-    #     Args:
-    #         src_sent: a single tokenized source sentence
-    #         beam_size: beam size
-    #         max_decoding_time_step: maximum number of time steps to unroll the decoding RNN
-    #
-    #     Returns:
-    #         hypotheses: a list of hypothesis, each hypothesis has two fields:
-    #             value: List[str]: the decoded target sentence, represented as a list of words
-    #             score: float: the log-likelihood of the target sentence
-    #     """
-    #
-    #     return hypotheses
+        Returns:
+            hypotheses: a list of hypothesis, each hypothesis has two fields:
+                value: List[str]: the decoded target sentence, represented as a list of words
+                score: float: the log-likelihood of the target sentence
+        """
 
+        strlist = [src_sent]
+        src_tensors = sentence2Tensor(self.vocab.src, strlist, True)
+        decoder_output, decoder_hidden = self.decoder()
 
-    def evaluate_ppl(self, dev_data, batch_size: int = 32):
+        return strlist
+
+    def evaluate_ppl(self, dev_data, batch_size: int = 64):
         """
         Evaluate perplexity on dev sentences
 
@@ -390,7 +396,7 @@ Returns:
         # e.g., `torch.no_grad()`
 
         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = -self(src_sents, tgt_sents).sum()
+            loss = -self(src_sents, tgt_sents, src_sents.__len__())  # .sum()
 
             cum_loss += loss
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
@@ -399,7 +405,6 @@ Returns:
         ppl = np.exp(cum_loss / cum_tgt_words)
 
         return ppl
-
 
     @staticmethod
     def load(model_path: str):
@@ -412,33 +417,37 @@ Returns:
 
         return torch.load(model_path)
 
-
     def save(self, path: str):
         """
         Save current model to file
         """
+        torch.save(self, 'NMT.model')
 
-        raise NotImplementedError()
+
+#        torch.save(self.encoder, 'encoder.model')
+#        torch.save(self.decoder, 'decoder.model')
+
+# raise NotImplementedError()
 
 
-    def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[Hypothesis]) -> float:
-        """
-        Given decoding results and reference sentences, compute corpus-level BLEU score
+def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[Hypothesis]) -> float:
+    """
+    Given decoding results and reference sentences, compute corpus-level BLEU score
 
-        Args:
-            references: a list of gold-standard reference target sentences
-            hypotheses: a list of hypotheses, one for each reference
+    Args:
+        references: a list of gold-standard reference target sentences
+        hypotheses: a list of hypotheses, one for each reference
 
-        Returns:
-            bleu_score: corpus-level BLEU score
-        """
-        if references[0][0] == '<s>':
-            references = [ref[1:-1] for ref in references]
+    Returns:
+        bleu_score: corpus-level BLEU score
+    """
+    if references[0][0] == '<s>':
+        references = [ref[1:-1] for ref in references]
 
-        bleu_score = corpus_bleu([[ref] for ref in references],
-                                 [hyp.value for hyp in hypotheses])
+    bleu_score = corpus_bleu([[ref] for ref in references],
+                             [hyp.value for hyp in hypotheses])
 
-        return bleu_score
+    return bleu_score
 
 
 def train(args: Dict[str, str]):
@@ -467,6 +476,7 @@ def train(args: Dict[str, str]):
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab,
                 learning_rate=float(args['--lr-decay']))
+
     print("NMT init over!")
     num_trial = 0
     train_iter = patience = cum_loss = report_loss = cumulative_tgt_words = report_tgt_words = 0
@@ -482,12 +492,11 @@ def train(args: Dict[str, str]):
         epoch += 1
         max_len = 0
         for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
+
             train_iter += 1
-            if src_sents.__len__() < batch_size:
-                break
 
             # (batch_size)
-            loss = -model(src_sents, tgt_sents)
+            loss = -model(src_sents, tgt_sents, src_sents.__len__())
 
             print(epoch, ':', loss)
 
@@ -535,7 +544,8 @@ def train(args: Dict[str, str]):
                 print('begin validation ...', file=sys.stderr)
 
                 # compute dev. ppl and bleu
-                dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)  # dev batch size can be a bit larger
+                dev_ppl = model.evaluate_ppl(dev_data,
+                                             batch_size=src_sents.__len__())  # dev batch size can be a bit larger
                 valid_metric = -dev_ppl
 
                 print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl), file=sys.stderr)
@@ -561,13 +571,13 @@ def train(args: Dict[str, str]):
                             exit(0)
 
                         # decay learning rate, and restore from previously best checkpoint
-                        lr = lr * float(args['--lr-decay'])
-                        print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
+                        # lr = lr * float(args['--lr-decay'])
+                        # print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
 
                         # load model
                         # torch.save(model,model_save_path)
 
-                        print('restore parameters of the optimizers', file=sys.stderr)
+                        # print('restore parameters of the optimizers', file=sys.stderr)
                         # You may also need to load the state of the optimizer saved before
 
                         # reset patience
@@ -585,19 +595,23 @@ def train(args: Dict[str, str]):
 '''
 
 
-# def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_decoding_time_step: int) -> List[List[Hypothesis]]:
-#     was_training = model.training
-#
-#     hypotheses = []
-#     for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
-#         example_hyps = model.beam_search(src_sent, beam_size=beam_size, max_decoding_time_step=max_decoding_time_step)
-#
-#         hypotheses.append(example_hyps)
-#
-#     return hypotheses
+def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_decoding_time_step: int) -> List[
+    List[Hypothesis]]:
+    was_training = model.training
+
+    hypotheses = []
+    for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
+        example_hyps = model.beam_search(src_sent, beam_size=beam_size, max_decoding_time_step=max_decoding_time_step)
+
+        hypotheses.append(example_hyps)
+
+    return hypotheses
 
 
 def decode(args: Dict[str, str]):
+    print("test start")
+'''
+    
     """
     performs decoding on a test set, and save the best-scoring decoding results.
     If the target gold-standard sentences are given, the function also computes
@@ -624,9 +638,44 @@ def decode(args: Dict[str, str]):
             top_hyp = hyps[0]
             hyp_sent = ' '.join(top_hyp.value)
             f.write(hyp_sent + '\n')
+'''
 
+def predict(model,src_tensor,batch_size):
+    with torch.no_grad():
+        model.encoder.eval()
+        model.decoder.eval()
+        encoder_hidden = model.encoder.initHidden(batch_size)
+        encoder_output, encoder_hidden = model.encoder(src_tensor,encoder_hidden)
+
+        decoder_input_list = []
+        for i in range(18):
+            tmp = []
+            if i == 0:
+                tmp.append(1)
+            else:
+                tmp.append(0)
+            decoder_input_list.append(tmp)
+
+        decoder_input_tensor = torch.tensor(decoder_input_list,device=device)
+        decoder_output, decoder_hidden = model.decoder(decoder_input_tensor, encoder_hidden,1,18)
+        #topv, topi = decoder_output.data.topk(1)
+        #    decoder_input = topi.squeeze().detach()
+        return decoder_output
 
 def main():
+    '''
+    model = torch.load('NMT.model')
+    src_sent = ['wissen','sie', ',', 'eines', 'der', 'großen','<unk>', 'beim', 'reisen' ,'und', 'eine', 'der', 'freuden',
+                'bei', 'der', '<unk>' ,'forschung' ,'ist']
+    src_list = []
+    src_list.append(src_sent)
+
+    src_tensor,len = sentence2Tensor(model.vocab.src,src_list,True)
+    predict_output = predict(model,src_tensor,1)
+
+    print("over")
+    '''
+
     args = docopt(__doc__)
     max_epoch = int(args['--max-epoch'])
     batch_size = int(args['--batch-size'])
