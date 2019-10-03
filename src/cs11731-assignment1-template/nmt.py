@@ -39,6 +39,7 @@ import math
 import pickle
 import sys
 import time
+import random
 from collections import namedtuple
 
 import numpy as np
@@ -63,6 +64,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_LENGTH = 55
 max_epoch = 0
 batch_size = 64
+teacher_forcing_ratio = 0.9
 
 
 def asMinutes(s):
@@ -113,61 +115,148 @@ def sentence2Tensor(dict, input_list: List[List[str]], transpose):
     return torch.tensor(sentence_indexes, dtype=torch.long, device=device), max_len, lens
 
 
-class EncoderRNN(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(EncoderRNN, self).__init__()
-        self.hidden_size = hidden_size
+# class EncoderRNN(nn.Module):
+#     def __init__(self, input_size, hidden_size):
+#         super(EncoderRNN, self).__init__()
+#         self.hidden_size = hidden_size
+#
+#         self.embedding = nn.Embedding(input_size, hidden_size)
+#         self.gru = nn.GRU(hidden_size, hidden_size)
+#
+#     def forward(self, input, hidden,src_lens_list):
+#         #        embedded = self.embedding(input).view(MAX_LENGTH, batch_size, -1)
+#         embedded = self.embedding(input)
+# #        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, src_lens_list,enforce_sorted=False)
+#         output = embedded
+#         output, hidden = self.gru(output, hidden)
+# #        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
+#         return output, hidden
+#
+#     def initHidden(self, batch_size):
+#         return torch.zeros(1, batch_size, self.hidden_size, device=device)
+#
+#
+# class DecoderRNN(nn.Module):
+#     def __init__(self, hidden_size, output_size):
+#         super(DecoderRNN, self).__init__()
+#         self.hidden_size = hidden_size
+#         self.embedding = nn.Embedding(output_size, hidden_size)
+#         self.gru = nn.GRU(hidden_size, hidden_size)
+#         self.out = nn.Linear(hidden_size, output_size)
+#
+#         self.softmax = nn.Softmax(dim=1)
+#
+#     def forward(self, input, hidden, batch_size,tgt_length, tgt_lens_list):
+#         '''
+#
+#         input = input.unsqueeze(0)
+#         embeded = self.embedding(input)
+#
+#         output, hidden = self.gru(embeded,hidden)
+#
+#         return self.out(output.squeeze(0)),hidden
+#
+#         '''
+#
+#         output = self.embedding(input).view(tgt_length, batch_size, -1)
+# #        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(output, tgt_lens_list,enforce_sorted=False)
+# #        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
+#         output = F.relu(output)
+#         output, hidden = self.gru(output, hidden)
+#
+#         output = self.softmax(self.out(output))
+#         #output = self.out(output)
+#
+#         return output, hidden
+#
+#     def initHidden(self, batch_size):
+#         return torch.zeros(1, batch_size, self.hidden_size, device=device)
 
-        self.embedding = nn.Embedding(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+class Encoder(nn.Module):
+    def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
 
-    def forward(self, input, hidden,src_lens_list):
-        #        embedded = self.embedding(input).view(MAX_LENGTH, batch_size, -1)
-        embedded = self.embedding(input)
-        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, src_lens_list,enforce_sorted=False)
-        output = embedded
-        output, hidden = self.gru(batch_packed, hidden)
-        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
-        return output, hidden
+        self.input_dim = input_dim
+        self.emb_dim = emb_dim
+        self.hid_dim = hid_dim
+        self.n_layers = n_layers
+        self.dropout = dropout
 
-    def initHidden(self, batch_size):
-        return torch.zeros(1, batch_size, self.hidden_size, device=device)
+        self.embedding = nn.Embedding(input_dim, emb_dim)
+
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src):
+        # src = [src sent len, batch size]
+
+        embedded = self.dropout(self.embedding(src))
+
+        # embedded = [src sent len, batch size, emb dim]
+
+        outputs, (hidden, cell) = self.rnn(embedded)
+
+        # outputs = [src sent len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+
+        # outputs are always from the top hidden layer
+
+        return hidden, cell
 
 
-class DecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size):
-        super(DecoderRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size, output_size)
+class Decoder(nn.Module):
+    def __init__(self, output_dim, emb_dim, hid_dim, n_layers, dropout):
+        super().__init__()
 
-        self.softmax = nn.LogSoftmax(dim=1)
+        self.emb_dim = emb_dim
+        self.hid_dim = hid_dim
+        self.output_dim = output_dim
+        self.n_layers = n_layers
+        self.dropout = dropout
 
-    def forward(self, input, hidden, batch_size,tgt_length, tgt_lens_list):
-        '''
+        self.embedding = nn.Embedding(output_dim, emb_dim)
+
+        self.rnn = nn.LSTM(emb_dim, hid_dim, n_layers, dropout=dropout)
+
+        self.out = nn.Linear(hid_dim, output_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input, hidden, cell):
+        # input = [batch size]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
+
+        # n directions in the decoder will both always be 1, therefore:
+        # hidden = [n layers, batch size, hid dim]
+        # context = [n layers, batch size, hid dim]
 
         input = input.unsqueeze(0)
-        embeded = self.embedding(input)
 
-        output, hidden = self.gru(embeded,hidden)
+        # input = [1, batch size]
 
-        return self.out(output.squeeze(0)),hidden
+        embedded = self.dropout(self.embedding(input))
 
-        '''
+        # embedded = [1, batch size, emb dim]
 
-        output = self.embedding(input).view(tgt_length, batch_size, -1)
-        batch_packed = torch.nn.utils.rnn.pack_padded_sequence(output, tgt_lens_list,enforce_sorted=False)
-        output, _ = torch.nn.utils.rnn.pad_packed_sequence(batch_packed)
-        output = F.relu(output)
-        output, hidden = self.gru(output, hidden)
+        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
 
-        # output = self.softmax(self.out(output[0]))
-        output = self.softmax(self.out(output))
-        return output, hidden
+        # output = [sent len, batch size, hid dim * n directions]
+        # hidden = [n layers * n directions, batch size, hid dim]
+        # cell = [n layers * n directions, batch size, hid dim]
 
-    def initHidden(self, batch_size):
-        return torch.zeros(1, batch_size, self.hidden_size, device=device)
+        # sent len and n directions will always be 1 in the decoder, therefore:
+        # output = [1, batch size, hid dim]
+        # hidden = [n layers, batch size, hid dim]
+        # cell = [n layers, batch size, hid dim]
+
+        prediction = self.out(output.squeeze(0))
+
+        # prediction = [batch size, output dim]
+
+        return prediction, hidden, cell
 
 
 class AttnDecoderRNN(nn.Module):
@@ -210,9 +299,9 @@ class AttnDecoderRNN(nn.Module):
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
 
 
-class NMT(object):
+class NMT(nn.Module):
 
-    def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2, learning_rate=0.1):
+    def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2, learning_rate=0.01):
         super(NMT, self).__init__()
 
         self.embed_size = embed_size
@@ -221,16 +310,58 @@ class NMT(object):
         self.vocab = vocab
         self.lr = learning_rate
 
+        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
         print("start to init encoder and decoder.")
-        self.encoder = EncoderRNN(vocab.src.__len__(), hidden_size).to(device)
+        self.encoder = Encoder(vocab.src.__len__(), embed_size, hidden_size, 1, 0.2).to(device)
         print("Encoder is done!")
         # self.decoder = AttnDecoderRNN(hidden_size, vocab.tgt.__len__(), dropout_rate).to(device)
-        self.decoder = DecoderRNN(hidden_size, vocab.tgt.__len__()).to(device)
+        self.decoder = Decoder(vocab.tgt.__len__(), embed_size, hidden_size, 1, 0.2).to(device)
         print("Decoder is done!")
         # self.encoder = EncoderRNN()
         # set the model
 
         # initialize neural network layers...
+
+    def evaluate(self, src_sents: List[List[str]], tgt_sents: List[List[str]], batch_size):
+        self.train()
+
+        encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=self.lr)
+        decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
+        encoder_optimizer.zero_grad()
+
+        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True)
+
+        tgt_tensor = torch.tensor(tgt_sents, device=device)
+        batch_size = src_tensor.shape[1]
+        max_len = src_tensor.shape[0]
+
+        trg_vocab_size = self.decoder.output_dim
+
+        outputs = torch.zeros(max_len, batch_size, trg_vocab_size).to(device)
+
+        hidden, cell = self.encoder(src_tensor)
+
+        input = tgt_tensor[0, :]
+
+        for t in range(1, max_len):
+            # insert input token embedding, previous hidden and previous cell states
+            # receive output tensor (predictions) and new hidden and cell states
+            output, hidden, cell = self.decoder(input, hidden, cell)
+
+            # place predictions in a tensor holding predictions for each token
+            outputs[t] = output
+
+            # decide if we are going to use teacher forcing or not
+            teacher_force = random.random() < teacher_forcing_ratio
+
+            # get the highest predicted token from our predictions
+            top1 = output.argmax(1)
+
+            # if teacher forcing, use actual next token as next input
+            # if not, use predicted token
+            input = top1
+
+        return outputs
 
     def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]], batch_size) -> Tensor:
         '''
@@ -253,58 +384,108 @@ class NMT(object):
         encoder_output, encoder_hidden = self.encoder(src_tensor, encoder_hidden)
 
 '''
+        self.train()
 
         encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=self.lr)
         decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
-
-        criterion = nn.NLLLoss()
-        # assert(src_sents.__len__(),tgt_sents.__len__())
-
-        src_tensor, src_len, src_lens_list = sentence2Tensor(self.vocab.src, src_sents, True)
-        tgt_tensor, tgt_len, tgt_lens_lits = sentence2Tensor(self.vocab.tgt, tgt_sents, True)
-
-        #       for i in range(src_tensor_list.__len__()):
-        loss = 0
         encoder_optimizer.zero_grad()
-        decoder_optimizer.zero_grad()
-        encoder_hidden = self.encoder.initHidden(batch_size)
 
-        # encoder_outputs = torch.zeros(MAX_LENGTH, batch_size, self.encoder.hidden_size, device=device)
+        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True)
+        tgt_tensor, tgt_len, tgt_lens = sentence2Tensor(self.vocab.tgt, tgt_sents, True)
 
-        encoder_output, encoder_hidden = self.encoder(src_tensor, encoder_hidden, src_lens_list)
-        # encoder_outputs = encoder_output[0, 0]
-        encoder_outputs = encoder_output
+        batch_size = src_tensor.shape[1]
+        max_len = tgt_tensor.shape[0]
 
-        decoder_hidden = encoder_hidden
+        trg_vocab_size = self.decoder.output_dim
 
-        decoder_output, decoder_hidden = self.decoder(tgt_tensor, decoder_hidden, batch_size,tgt_len, tgt_lens_lits)
-        # topv, topi = decoder_output.topk(1)
-        # decoder_input = topi.squeeze().detach()
+        outputs = torch.zeros(max_len, batch_size, trg_vocab_size).to(device)
 
-        #        for i in range(batch_size):
-        #            tmp1 = decoder_output[i]
-        #            tmp2 = tgt_tensor[i]
+        hidden, cell = self.encoder(src_tensor)
 
-        decoder_output = decoder_output[0:].view(-1, decoder_output.shape[-1])
-        tgt_tensor = tgt_tensor[0:].view(-1)
-        loss = criterion(decoder_output, tgt_tensor)
+        input = tgt_tensor[0, :]
 
-        # for i in range(0, batch_size):
-        #     tmp2 = torch.unsqueeze(decoder_output[i],0)
-        #
-        #     for j in range(0,MAX_LENGTH):
-        #         tmp3 = tgt_tensor[i][j].view(1)
-        #         tmp = criterion(tmp2, tgt_tensor[i][j].view(1))
-        #         loss += tmp
+        for t in range(1, max_len):
+            # insert input token embedding, previous hidden and previous cell states
+            # receive output tensor (predictions) and new hidden and cell states
+            output, hidden, cell = self.decoder(input, hidden, cell)
 
-        # if decoder_input.item() == 1:
-        #     break
+            # place predictions in a tensor holding predictions for each token
+            outputs[t] = output
 
+            # decide if we are going to use teacher forcing or not
+            teacher_force = random.random() < teacher_forcing_ratio
+
+            # get the highest predicted token from our predictions
+            top1 = output.argmax(1)
+
+            # if teacher forcing, use actual next token as next input
+            # if not, use predicted token
+            input = tgt_tensor[t] if teacher_force else top1
+
+        outputs = outputs[1:].view(-1, outputs.shape[-1])
+        tgt_tensor = tgt_tensor[1:].view(-1)
+
+        loss = self.criterion(outputs, tgt_tensor)
         loss.backward()
+
+        # torch.nn.utils.clip_grad_norm_(self.parameters(), 1)
 
         encoder_optimizer.step()
         decoder_optimizer.step()
+
         return loss.item()
+
+        # encoder_optimizer = optim.SGD(self.encoder.parameters(), lr=self.lr)
+        # decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
+        #
+        # criterion = nn.NLLLoss()
+        # # assert(src_sents.__len__(),tgt_sents.__len__())
+        #
+        # src_tensor, src_len, src_lens_list = sentence2Tensor(self.vocab.src, src_sents, True)
+        # tgt_tensor, tgt_len, tgt_lens_lits = sentence2Tensor(self.vocab.tgt, tgt_sents, True)
+        #
+        # #       for i in range(src_tensor_list.__len__()):
+        # loss = 0
+        # encoder_optimizer.zero_grad()
+        # decoder_optimizer.zero_grad()
+        # encoder_hidden = self.encoder.initHidden(batch_size)
+        #
+        # # encoder_outputs = torch.zeros(MAX_LENGTH, batch_size, self.encoder.hidden_size, device=device)
+        #
+        # encoder_output, encoder_hidden = self.encoder(src_tensor, encoder_hidden, src_lens_list)
+        # # encoder_outputs = encoder_output[0, 0]
+        # encoder_outputs = encoder_output
+        #
+        # decoder_hidden = encoder_hidden
+        #
+        # decoder_output, decoder_hidden = self.decoder(tgt_tensor, decoder_hidden, batch_size,tgt_len, tgt_lens_lits)
+        # # topv, topi = decoder_output.topk(1)
+        # # decoder_input = topi.squeeze().detach()
+        #
+        # #        for i in range(batch_size):
+        # #            tmp1 = decoder_output[i]
+        # #            tmp2 = tgt_tensor[i]
+        #
+        # decoder_output = decoder_output[0:].view(-1, decoder_output.shape[-1])
+        # tgt_tensor = tgt_tensor[0:].view(-1)
+        # loss = criterion(decoder_output, tgt_tensor)
+        #
+        # # for i in range(0, batch_size):
+        # #     tmp2 = torch.unsqueeze(decoder_output[i],0)
+        # #
+        # #     for j in range(0,MAX_LENGTH):
+        # #         tmp3 = tgt_tensor[i][j].view(1)
+        # #         tmp = criterion(tmp2, tgt_tensor[i][j].view(1))
+        # #         loss += tmp
+        #
+        # # if decoder_input.item() == 1:
+        # #     break
+        #
+        # loss.backward()
+        #
+        # encoder_optimizer.step()
+        # decoder_optimizer.step()
+        # return loss.item()
 
     """
 take a mini-batch of source and target sentences, compute the log-likelihood of 
@@ -585,8 +766,9 @@ def train(args: Dict[str, str]):
 
             if epoch == max_epoch:
                 print('reached maximum number of epochs!', file=sys.stderr)
-                torch.save(model.decoder, 'decoder.model')
-                torch.save(model.encoder, 'encoder.model')
+                torch.save(model, "NMT.model")
+                # torch.save(model.decoder, 'decoder.model')
+                # torch.save(model.encoder, 'encoder.model')
                 exit(0)
 
 
@@ -610,6 +792,8 @@ def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_
 
 def decode(args: Dict[str, str]):
     print("test start")
+
+
 '''
     
     """
@@ -640,15 +824,16 @@ def decode(args: Dict[str, str]):
             f.write(hyp_sent + '\n')
 '''
 
-def predict(model,src_tensor,batch_size):
+
+def predict(model, src_tensor, batch_size):
     with torch.no_grad():
         model.encoder.eval()
         model.decoder.eval()
         encoder_hidden = model.encoder.initHidden(batch_size)
-        encoder_output, encoder_hidden = model.encoder(src_tensor,encoder_hidden)
+        encoder_output, encoder_hidden = model.encoder(src_tensor, encoder_hidden, [7])
 
         decoder_input_list = []
-        for i in range(18):
+        for i in range(7):
             tmp = []
             if i == 0:
                 tmp.append(1)
@@ -656,24 +841,41 @@ def predict(model,src_tensor,batch_size):
                 tmp.append(0)
             decoder_input_list.append(tmp)
 
-        decoder_input_tensor = torch.tensor(decoder_input_list,device=device)
-        decoder_output, decoder_hidden = model.decoder(decoder_input_tensor, encoder_hidden,1,18)
-        #topv, topi = decoder_output.data.topk(1)
+        decoder_input_tensor = torch.tensor(decoder_input_list, device=device)
+        decoder_output, decoder_hidden = model.decoder(decoder_input_tensor, encoder_hidden, 1, 7, [7])
+        # topv, topi = decoder_output.data.topk(1)
         #    decoder_input = topi.squeeze().detach()
         return decoder_output
 
+
 def main():
-    '''
+
+    args = docopt(__doc__)
     model = torch.load('NMT.model')
-    src_sent = ['wissen','sie', ',', 'eines', 'der', 'großen','<unk>', 'beim', 'reisen' ,'und', 'eine', 'der', 'freuden',
-                'bei', 'der', '<unk>' ,'forschung' ,'ist']
-    src_list = []
-    src_list.append(src_sent)
+    train_data_src = read_corpus(args['--train-src'], source='src')
+    train_data_tgt = read_corpus(args['--train-tgt'], source='tgt')
+    train_data = list(zip(train_data_src, train_data_tgt))
 
-    src_tensor,len = sentence2Tensor(model.vocab.src,src_list,True)
-    predict_output = predict(model,src_tensor,1)
+    for src_sents, tgt_sents in batch_iter(train_data, batch_size=1, shuffle=True):
+        target_list = [1]
+        target_lists = []
+        target_lists.append(target_list)
 
-    print("over")
+        predict_output = model.evaluate(src_sents,target_lists,1)
+
+        topv, topi = predict_output.data.topk(1)
+        output_str = ""
+        refer_str = ""
+
+        for i in range(tgt_sents[0].__len__()):
+            refer_str += tgt_sents[0][i]
+            refer_str += " "
+        for i in range(src_sents[0].__len__()):
+            output_str += model.vocab.tgt.id2word[topi[i].item()]
+            output_str += " "
+        print("reference:\n",refer_str)
+        print(output_str)
+        print("over")
     '''
 
     args = docopt(__doc__)
@@ -690,7 +892,6 @@ def main():
         decode(args)
     else:
         raise RuntimeError(f'invalid mode')
-
-
+    '''
 if __name__ == '__main__':
     main()
