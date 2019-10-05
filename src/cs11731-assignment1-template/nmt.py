@@ -88,20 +88,22 @@ def sentence_filter(string):
     return string
 
 
-def sentence2Tensor(dict, input_list: List[List[str]], transpose):
+def sentence2Tensor(dict, input_list: List[List[str]], transpose, padding):
     total = input_list.__len__()
     sentence_indexes = []
     lens = []
     for sentence in input_list:
         # sentence = sentence_filter(sentence)
         indexes = []
-        indexes.append(1)
+        if padding == True:
+            indexes.append(1)
         for word in sentence:
             if word in dict:
                 indexes.append(dict[word])
             else:
                 indexes.append(3)
-        indexes.append(2)  # append </s>
+        if padding == True:
+            indexes.append(2)  # append </s>
         sentence_indexes.append(indexes)
         lens.append(indexes.__len__())
 
@@ -329,7 +331,7 @@ class NMT(nn.Module):
         decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
         encoder_optimizer.zero_grad()
 
-        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True)
+        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True, False)
 
         tgt_tensor = torch.tensor(tgt_sents, device=device)
         batch_size = src_tensor.shape[1]
@@ -343,7 +345,7 @@ class NMT(nn.Module):
 
         input = tgt_tensor[0, :]
 
-        for t in range(1, max_len):
+        for t in range(0, max_len):
             # insert input token embedding, previous hidden and previous cell states
             # receive output tensor (predictions) and new hidden and cell states
             output, hidden, cell = self.decoder(input, hidden, cell)
@@ -390,8 +392,8 @@ class NMT(nn.Module):
         decoder_optimizer = optim.SGD(self.decoder.parameters(), lr=self.lr)
         encoder_optimizer.zero_grad()
 
-        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True)
-        tgt_tensor, tgt_len, tgt_lens = sentence2Tensor(self.vocab.tgt, tgt_sents, True)
+        src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True, False)
+        tgt_tensor, tgt_len, tgt_lens = sentence2Tensor(self.vocab.tgt, tgt_sents, True, True)
 
         batch_size = src_tensor.shape[1]
         max_len = tgt_tensor.shape[0]
@@ -552,7 +554,7 @@ Returns:
         """
 
         strlist = [src_sent]
-        src_tensors = sentence2Tensor(self.vocab.src, strlist, True)
+        src_tensors = sentence2Tensor(self.vocab.src, strlist, True, False)
         decoder_output, decoder_hidden = self.decoder()
 
         return strlist
@@ -873,9 +875,8 @@ def main():
         for i in range(src_sents[0].__len__()):
             output_str += model.vocab.tgt.id2word[topi[i].item()]
             output_str += " "
-        print("reference:\n",refer_str)
+        print("\nreference:\n",refer_str,"\n-------------------------------")
         print(output_str)
-        print("over")
     '''
 
     args = docopt(__doc__)
