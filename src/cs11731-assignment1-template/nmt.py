@@ -106,8 +106,8 @@ class Attention(nn.Module):
         self.enc_hid_dim = encoder_hidden_dim
         self.dec_hid_dim = dec_hid_dim
 
-        self.attention = nn.Linear((encoder_hidden_dim * 2) + dec_hid_dim, dec_hid_dim)
-        self.value = nn.Parameter(torch.rand(dec_hid_dim))
+        self.attn = nn.Linear((encoder_hidden_dim * 2) + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Parameter(torch.rand(dec_hid_dim))
 
     def forward(self, hidden, encoder_outputs, mask):
         batch_size = encoder_outputs.shape[1]
@@ -117,11 +117,11 @@ class Attention(nn.Module):
 
         encoder_outputs = encoder_outputs.permute(1, 0, 2)
 
-        energy = torch.tanh(self.attention(torch.cat((hidden, encoder_outputs), dim=2)))
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
 
         energy = energy.permute(0, 2, 1)
 
-        v = self.value.repeat(batch_size, 1).unsqueeze(1)
+        v = self.v.repeat(batch_size, 1).unsqueeze(1)
 
         attention = torch.bmm(v, energy).squeeze(1)
 
@@ -244,7 +244,7 @@ class NMT(nn.Module):
     def evaluate(self, src_sents: List[List[str]], tgt_sents: List[List[str]]):
 
         self.eval()
-        beam_size = 10
+        beam_size = 1
         src_tensor, src_len, src_lens = sentence2Tensor(self.vocab.src, src_sents, True, True)
 
         tgt_tensor = torch.tensor(tgt_sents, device=device)
@@ -618,18 +618,18 @@ def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_
 
 
 def decode(args: Dict[str, str]):
-    model = torch.load('NMT.model')
-    train_data_src = read_corpus(args['--train-src'], source='src')
-    train_data_tgt = read_corpus(args['--train-tgt'], source='tgt')
-    train_data = list(zip(train_data_src, train_data_tgt))
+    model = torch.load(args['--save-to'])
+    dev_data_src = read_corpus(args['--dev-src'], source='src')
+    dev_data_tgt = read_corpus(args['--dev-tgt'], source='tgt')
+    dev_data = list(zip(dev_data_src, dev_data_tgt))
     hyp_list = []
     output_strs = []
-    for src_sents, tgt_sents in batch_iter(train_data, batch_size=1, shuffle=True):
+    for src_sents, tgt_sents in batch_iter(dev_data, batch_size=1, shuffle=True):
         target_list = [1]
         target_lists = []
         target_lists.append(target_list)
 
-        predict_output, likelihood = model.evaluate(src_sents, target_lists, 1)
+        predict_output, likelihood = model.evaluate(src_sents, target_lists)
 
         list_output = []
         output_str = ""
@@ -654,12 +654,12 @@ def decode(args: Dict[str, str]):
         print("\nreference:\n", refer_str, "\n-------------------------------")
         print(output_str)
 
-    f = open("work_dir/decode.txt", 'a')
+    f = open("work_dir/dev.txt", 'a')
     for i in range(hyp_list.__len__()):
         f.write(output_strs[i])
     f.close()
     print("start to calculate bleu score!")
-    print(compute_corpus_level_bleu_score(train_data_tgt, hyp_list))
+    print(compute_corpus_level_bleu_score(dev_data_tgt, hyp_list))
 
 
 '''
@@ -694,10 +694,6 @@ def decode(args: Dict[str, str]):
 
 
 def main():
-    '''
-    args = docopt(__doc__)
-    decode(args)
-    '''
 
     args = docopt(__doc__)
     max_epoch = int(args['--max-epoch'])
@@ -713,7 +709,6 @@ def main():
         decode(args)
     else:
         raise RuntimeError(f'invalid mode')
-
 
 if __name__ == '__main__':
     main()
